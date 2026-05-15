@@ -26,6 +26,14 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── 脱敏工具 ──────────────────────────────────────────────
+def mask(value: str, show: int = 3) -> str:
+    """保留前后 show 位，中间用 *** 遮盖"""
+    if not value or len(value) <= show * 2:
+        return "***"
+    return value[:show] + "***" + value[-show:]
+
+
 # ── 环境变量 ──────────────────────────────────────────────
 USERNAME         = os.environ["ZYTRANO_USERNAME"]       # Email or Username
 PASSWORD         = os.environ["ZYTRANO_PASSWORD"]
@@ -61,7 +69,7 @@ def wxpush(content: str):
         with urllib.request.urlopen(req, timeout=10) as resp:
             result = json.loads(resp.read())
             if result.get("success"):
-                log.info("📨 WxPusher 推送成功")
+                log.info(f"📨 WxPusher 推送成功 (token: {mask(WXPUSHER_TOKEN)}, uid: {mask(WXPUSHER_UID)})")
             else:
                 log.warning(f"📨 WxPusher 推送失败: {result}")
     except Exception as e:
@@ -278,7 +286,7 @@ async def ensure_cf_passed(tab, url: str, timeout=20) -> bool:
 # ── 登录 ──────────────────────────────────────────────────
 async def login(tab, max_retries=3) -> bool:
     for attempt in range(1, max_retries + 1):
-        log.info(f"登录 {attempt}/{max_retries} ...")
+        log.info(f"登录 {attempt}/{max_retries} (用户: {mask(USERNAME)}) ...")
         if not await ensure_cf_passed(tab, LOGIN_URL):
             log.error("CF 验证失败，重试")
             continue
@@ -358,7 +366,7 @@ async def get_servers_info(tab) -> list[dict]:
         html = ""
 
     server_ids = re.findall(r"handleServerRenew\(['\"]([^'\"]+)['\"]\)", html)
-    log.info(f"找到服务器 ID: {server_ids}")
+    log.info(f"找到服务器 ID: {[mask(s) for s in server_ids]}")
 
     # 读页面文字，提取 "Suspended in: X days, Y hours, Z minutes"
     text = await get_text(tab)
@@ -386,7 +394,7 @@ async def get_servers_info(tab) -> list[dict]:
             "suspended_in": suspended_matches[i] if i < len(suspended_matches) else "未知",
         }
         servers.append(info)
-        log.info(f"服务器 [{info['name']}] ID={sid} 到期：{info['suspended_in']}")
+        log.info(f"服务器 [{info['name']}] ID={mask(sid)} 到期：{info['suspended_in']}")
 
     return servers
 
@@ -406,7 +414,7 @@ def parse_days_remaining(suspended_in: str) -> float:
 
 async def renew_server(tab, server_id: str) -> bool:
     """调用 handleServerRenew(server_id) 续期"""
-    log.info(f"续期服务器 {server_id} ...")
+    log.info(f"续期服务器 {mask(server_id)} ...")
     await human_mouse_move(tab)
     await human_delay(0.5, 1.0)
 
@@ -415,7 +423,7 @@ async def renew_server(tab, server_id: str) -> bool:
         tab,
         f"handleServerRenew('{server_id}'); return 'called';"
     )
-    log.info(f"handleServerRenew 调用结果: {result}")
+    log.info(f"handleServerRenew 调用结果: {result} (server: {mask(server_id)})")
     await asyncio.sleep(3)
 
     # 如果弹出确认对话框，点确认（按优先级尝试各种按钮文字）
