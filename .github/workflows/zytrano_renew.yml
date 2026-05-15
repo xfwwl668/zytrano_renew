@@ -1,4 +1,4 @@
-name: Zytrano 自动续期
+name: Zytrano Auto Renew
 
 on:
   schedule:
@@ -11,24 +11,24 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: 检出代码
+      - name: Check out code
         uses: actions/checkout@v4
 
-      - name: 设置 Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 安装系统依赖（Chromium + Xvfb + 中文字体）
+      - name: Install system dependencies (Chromium + Xvfb)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq chromium-browser xvfb ffmpeg fonts-noto-cjk
+          sudo apt-get install -y -qq chromium-browser xvfb ffmpeg
 
-      - name: 安装 Python 依赖
+      - name: Install Python dependencies
         run: |
           pip install pydoll-python httpx
 
-      - name: 运行脚本（带 Xvfb 虚拟显示 + 录屏）
+      - name: Run script (Xvfb + screen recording)
         env:
           ZYTRANO_USERNAME: ${{ secrets.ZYTRANO_USERNAME }}
           ZYTRANO_PASSWORD: ${{ secrets.ZYTRANO_PASSWORD }}
@@ -51,7 +51,7 @@ jobs:
           wait $RECORD_PID 2>/dev/null || true
           pkill Xvfb 2>/dev/null || true
 
-      - name: 上传截图和录屏（调试用）
+      - name: Upload screenshots and recording (debug)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -60,3 +60,25 @@ jobs:
             ./screenshots/*.png
             /tmp/recording.mp4
           retention-days: 3
+
+      - name: Delete old workflow runs (keep latest 2)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: { workflow_runs } } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'zytrano_renew.yml',
+              per_page: 100,
+            });
+            // Already sorted newest first by GitHub API
+            const toDelete = workflow_runs.slice(2);
+            for (const run of toDelete) {
+              await github.rest.actions.deleteWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+              });
+              console.log(`Deleted run #${run.run_number} (id=${run.id}, created=${run.created_at})`);
+            }
