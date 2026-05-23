@@ -2,7 +2,7 @@
 Zytrano.top 自动续期脚本
 - CloakBrowser（源码级指纹伪装）过 Cloudflare
 - Playwright 同步 API 操控浏览器
-- 伪装人类行为（随机延迟 / humanize 输入）
+- 登录前等待 Turnstile 完成 + Shadow DOM 手动点击兜底
 - 续期后读取 "Suspended in: X days, Y hours, Z minutes" 推送 WxPusher
 """
 
@@ -136,13 +136,146 @@ def navigate(page, url: str, timeout=45) -> bool:
     if wait_cf_pass(page, timeout=timeout):
         return True
 
-    # 刷新一次再等
     log.info("CF 未过，刷新重试...")
     try:
         page.reload(wait_until="domcontentloaded", timeout=30000)
     except Exception:
         pass
     return wait_cf_pass(page, timeout=30)
+
+# ── Turnstile 等待 + 手动点击兜底 ────────────────────────
+def wait_turnstile_and_click(page, timeout=30) -> bool:
+    """
+    等待登录页内嵌的 Turnstile 验证完成。
+    策略：
+      1. 先轮询 cf-turnstile-response 隐藏域是否有值（自动通过）
+      2. 若超过 5s 仍在 Verifying，尝试 Shadow DOM 穿透点击 checkbox
+      3. 再等待 response 填入
+    返回 True 表示 Turnstile token 已就绪，可以提交表单。
+    """
+    log.info("等待 Turnstile 完成...")
+
+    def has_token() -> bool:
+        val = js_eval(page, """
+            (() => {
+                // cf-turnstile 会把 token 写入 name="cf-turnstile-response" 的隐藏 input
+                const el = document.querySelector(
+                    'input[name="cf-turnstile-response"]'
+                );
+                return el ? (el.value || "").length > 10 : false;
+            })()
+        """)
+        return bool(val)
+
+    def turnstile_state() -> str:
+        """返回 'verifying' / 'checked' / 'unknown'"""
+        state = js_eval(page, """
+            (() => {
+                // Turnstile widget 的 iframe src 包含 challenges.cloudflare.com
+                const iframes = document.querySelectorAll(
+                    'iframe[src*="challenges.cloudflare.com"]'
+                );
+                if (!iframes.length) return 'unknown';
+                // 找包含 checkbox 的 iframe
+                for (const f of iframes) {
+                    try {
+                        // 只能检测 same-origin，跨域 iframe 内部读不到
+                        // 但可以通过父容器的 data 属性判断
+                    } catch(e) {}
+                }
+                // 回退：检测页面文字
+                const body = document.body.innerText || '';
+                if (body.includes('Verifying')) return 'verifying';
+                if (body.includes('Verify you are human')) return 'unchecked';
+                return 'unknown';
+            })()
+        """)
+        return state or "unknown"
+
+    # 第一阶段：最多等 5s，看 token 是否自动填入
+    for i in range(10):
+        if has_token():
+            log.info(f"✅ Turnstile token 已就绪（{i*0.5:.1f}s，自动通过）")
+            return True
+        time.sleep(0.5)
+
+    # 第二阶段：尝试 Shadow DOM 穿透点击 checkbox
+    log.info("Turnstile 仍在 Verifying，尝试 Shadow DOM 点击 checkbox...")
+    clicked = _shadow_click_turnstile(page)
+    if clicked:
+        log.info("已点击 Turnstile checkbox，等待 token...")
+    else:
+        log.warning("Shadow DOM 点击失败，继续等待自动通过...")
+
+    # 第三阶段：再等最多 timeout 秒
+    for i in range(timeout * 2):
+        if has_token():
+            log.info(f"✅ Turnstile token 已就绪（点击后 {i*0.5:.1f}s）")
+            return True
+        if i % 10 == 0 and i > 0:
+            log.info(f"  Turnstile 等待中... {i*0.5:.0f}s")
+            take_screenshot(page, f"turnstile_waiting_{i}")
+        time.sleep(0.5)
+
+    log.error("Turnstile 等待超时，强行继续（可能失败）")
+    return False
+
+
+def _shadow_click_turnstile(page) -> bool:
+    """
+    通过 JS 遍历 Shadow DOM，找到 Turnstile iframe 内的 checkbox 并点击。
+    Turnstile 的结构：
+      div[data-sitekey] (宿主)
+        └─ shadow-root
+             └─ iframe[src*="challenges.cloudflare.com"]
+    iframe 跨域，无法直接操作内部 DOM；
+    但可以直接点击 iframe 元素本身触发焦点，
+    或用坐标点击 iframe 中心位置。
+    """
+    try:
+        # 方法1：点击 Turnstile iframe 中心（模拟人类点击 checkbox 区域）
+        clicked = js_eval(page, """
+            (() => {
+                const iframe = document.querySelector(
+                    'iframe[src*="challenges.cloudflare.com"]'
+                );
+                if (!iframe) return false;
+                const rect = iframe.getBoundingClientRect();
+                // checkbox 在 iframe 左侧约 25px 处
+                const x = rect.left + 25;
+                const y = rect.top + rect.height / 2;
+                // 模拟完整点击事件序列
+                ['mouseover','mouseenter','mousemove','mousedown','mouseup','click']
+                    .forEach(type => {
+                        document.elementFromPoint(x, y)?.dispatchEvent(
+                            new MouseEvent(type, {
+                                bubbles: true, cancelable: true,
+                                clientX: x, clientY: y, view: window
+                            })
+                        );
+                    });
+                return true;
+            })()
+        """)
+        if clicked:
+            log.info("  方法1：iframe 坐标点击已触发")
+            time.sleep(2)
+            return True
+    except Exception as e:
+        log.debug(f"  方法1 失败: {e}")
+
+    try:
+        # 方法2：用 Playwright locator 直接 click iframe
+        iframe_loc = page.locator('iframe[src*="challenges.cloudflare.com"]').first
+        iframe_loc.click(position={"x": 25, "y": 15}, timeout=5000)
+        log.info("  方法2：Playwright iframe.click() 已触发")
+        time.sleep(2)
+        return True
+    except Exception as e:
+        log.debug(f"  方法2 失败: {e}")
+
+    return False
+
 
 # ── 登录 ──────────────────────────────────────────────────
 def login(page, max_retries=3) -> bool:
@@ -152,9 +285,7 @@ def login(page, max_retries=3) -> bool:
             log.error("CF 验证失败，重试")
             continue
 
-        take_screenshot(page, "01_login_page")
-
-        # 等待登录表单
+        # 等待登录表单出现
         try:
             page.wait_for_selector(
                 'input[placeholder="Email or Username"], input[name="user"]',
@@ -166,6 +297,7 @@ def login(page, max_retries=3) -> bool:
             continue
 
         human_delay(0.5, 1.0)
+        take_screenshot(page, "01_login_page")
 
         # 填写用户名
         try:
@@ -189,6 +321,12 @@ def login(page, max_retries=3) -> bool:
             pass_el = page.locator('input[type="password"]').first
             pass_el.click()
             pass_el.type(PASSWORD, delay=random.randint(60, 130))
+        human_delay(0.5, 1.0)
+
+        # ★ 关键：等 Turnstile 完成再点登录
+        take_screenshot(page, "01b_before_turnstile_wait")
+        wait_turnstile_and_click(page, timeout=30)
+        take_screenshot(page, "01c_after_turnstile_wait")
         human_delay(0.5, 1.0)
 
         # 点击 Sign In
@@ -269,7 +407,6 @@ def renew_server(page, server_id: str) -> bool:
     log.info(f"handleServerRenew 调用结果: {result} (server: {mask(server_id)})")
     time.sleep(3)
 
-    # 弹出确认对话框，依次尝试各种按钮文字
     confirm_texts = ["Yes, renew it!", "Yes, renew it", "Confirm", "OK"]
     clicked = False
     for _ in range(3):
@@ -311,25 +448,21 @@ def main():
     page = browser.new_page()
 
     try:
-        # 1. 登录
         if not login(page):
             wxpush("❌ Zytrano 登录失败，请检查账号密码或 CF 验证")
             return
 
-        # 2. 读取服务器信息
         servers = get_servers_info(page)
         if not servers:
             wxpush("❌ Zytrano 未找到服务器信息，请检查截图")
             return
 
-        # 3. 无条件续期所有服务器
         results = []
         for s in servers:
             days = parse_days_remaining(s["suspended_in"])
             log.info(f"[{s['name']}] 续期前剩余约 {days:.2f} 天 ({s['suspended_in']})")
             success = renew_server(page, s["server_id"])
 
-            # 续期后重新读最新到期信息
             navigate(page, SERVERS_URL)
             time.sleep(3)
             text_new = get_text(page)
@@ -345,7 +478,6 @@ def main():
                 "suspended_in": new_suspended,
             })
 
-        # 4. 构建推送消息
         lines = ["🖥️ Zytrano 自动续期报告", ""]
         for r in results:
             status = "✅ 已续期" if r["renewed"] else "❌ 续期失败"
