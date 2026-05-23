@@ -142,28 +142,61 @@ def navigate(page, url: str, timeout=45) -> bool:
         pass
     return wait_cf_pass(page, timeout=30)
 
-# ── Turnstile 点击（针对已知 DOM 结构）─────────────────────
+# ── Turnstile 点击（终极修复版）─────────────────────────────
 def click_turnstile_checkbox(page, timeout=30) -> bool:
     """
-    已知 Turnstile 真实 DOM 结构（来自 DevTools 抓包确认）：
-      div.cf-turnstile
-        └─ #shadow-root (closed)
-             └─ iframe[src*="challenges.cloudflare.com"]
-                  └─ #document
-                       └─ body
-                            └─ #shadow-root (closed)
-                                 └─ div.cb-c > label > span.cb-i   ← 视觉勾选框，click 这里
-                                                      input[type=checkbox] ← 实际 checkbox
-
-    关键修复：
-    1. cf-turnstile-response input 在 closed shadow-root 内，普通 querySelector 找不到，
-       须用递归穿透所有 shadow root 的 JS 写法检查 token。
-    2. iframe 本身也在 shadow-root 内，wait_for_selector 须用 pierce: 伪类穿透，
-       或降级为直接用 frame_locator 探测。
-    3. 静默等待时间延长到 15s（GitHub Actions 环境指纹评估耗时更长）。
+    关键洞察：
+    - Zytrano 使用 Cloudflare Turnstile managed 模式（有勾选框），需要点击
+    - iframe 在 div.cf-turnstile 的 closed shadow-root 内
+    - wait_for_selector / pierce: 都无法可靠定位该 iframe
+    - 正确方案：用 page.frames 枚举所有 frame（CDP 协议层面，不受 shadow DOM 限制）
+      然后找到 URL 含 challenges.cloudflare.com 的那个 frame
     """
 
-    # ★ 修复1：递归穿透所有 shadow root 检查 token
+    # ── 诊断工具：打印当前所有 frame 列表 ──────────────────────
+    def dump_frames(label: str):
+        try:
+            frames = page.frames
+            log.info(f"[诊断/{label}] 当前共 {len(frames)} 个 frame：")
+            for i, f in enumerate(frames):
+                url = (f.url or "about:blank")[:120]
+                log.info(f"  [{i}] {url}")
+        except Exception as e:
+            log.warning(f"[诊断/{label}] dump_frames 失败: {e}")
+
+    # ── 诊断工具：打印 token input 的实际状态 ──────────────────
+    def dump_token_state(label: str):
+        val = js_eval(page, """
+            (() => {
+                function deepQuery(root, sel) {
+                    let el = root.querySelector(sel);
+                    if (el) return el;
+                    for (const host of root.querySelectorAll('*')) {
+                        if (host.shadowRoot) {
+                            el = deepQuery(host.shadowRoot, sel);
+                            if (el) return el;
+                        }
+                    }
+                    return null;
+                }
+                const el = deepQuery(document, 'input[name="cf-turnstile-response"]');
+                if (!el) return 'INPUT_NOT_FOUND';
+                const v = el.value || '';
+                return v.length === 0 ? 'EMPTY' : `len=${v.length} prefix=${v.slice(0,20)}`;
+            })()
+        """)
+        log.info(f"[诊断/{label}] cf-turnstile-response: {val}")
+
+    # ── 诊断工具：打印页面当前 URL + 标题 ──────────────────────
+    def dump_page_state(label: str):
+        try:
+            url = page.url
+            title = page.title()
+            log.info(f"[诊断/{label}] URL={url}  title={title!r}")
+        except Exception as e:
+            log.warning(f"[诊断/{label}] dump_page_state 失败: {e}")
+
+    # ★ 递归穿透所有 shadow root 检查 token
     def token_ready() -> bool:
         val = js_eval(page, """
             (() => {
@@ -184,99 +217,149 @@ def click_turnstile_checkbox(page, timeout=30) -> bool:
         """)
         return bool(val)
 
-    # ★ 修复2：静默等待延长到 15s（30 × 0.5s）
-    log.info("等待 Turnstile 静默通过（最多 15s）...")
+    # ── 阶段1：静默等待（最多 15s）──────────────────────────────
+    log.info("【Turnstile 阶段1】等待静默通过（最多 15s）...")
+    dump_page_state("阶段1开始")
+    dump_token_state("阶段1开始")
     for i in range(30):
         if token_ready():
             log.info(f"✅ Turnstile 静默通过（{i * 0.5:.1f}s），无需点击")
             return True
         time.sleep(0.5)
+    dump_token_state("阶段1结束_未过")
 
-    # ★ 修复3：iframe 在 closed shadow-root 内，用 pierce: 穿透，失败则降级
-    log.info("静默未过，等待 Turnstile iframe 加载...")
-    iframe_found = False
-    try:
-        page.wait_for_selector(
-            "pierce/iframe[src*='challenges.cloudflare.com']",
-            timeout=12000,
-        )
-        iframe_found = True
-    except Exception:
-        # pierce 不支持时降级：直接用 frame_locator 探测 iframe 内容
+    # ── 阶段2：枚举 frames 找 Turnstile iframe ───────────────────
+    log.info("【Turnstile 阶段2】用 page.frames 枚举查找 Turnstile frame（最多 8s）...")
+    dump_frames("阶段2开始")
+    cf_frame = None
+    for tick in range(16):
+        for f in page.frames:
+            if "challenges.cloudflare.com" in (f.url or ""):
+                cf_frame = f
+                break
+        if cf_frame:
+            log.info(f"  ✅ 第 {tick * 0.5:.1f}s 找到 Turnstile frame")
+            break
+        time.sleep(0.5)
+
+    if not cf_frame:
+        # 枚举失败：打印完整诊断后降级
+        log.warning("【Turnstile 阶段2】frames 枚举 8s 内未找到 Turnstile frame")
+        dump_frames("枚举失败")
+        dump_page_state("枚举失败")
+        take_screenshot(page, "turnstile_frame_not_found")
+
+        # 降级：frame_locator
+        log.info("  降级尝试 frame_locator...")
+        cf_frame_loc = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
+        fallback_clicked = False
         try:
-            cf_frame_test = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
-            cf_frame_test.locator("body").wait_for(state="attached", timeout=8000)
-            iframe_found = True
-        except Exception:
-            log.warning("Turnstile iframe 未出现")
+            cf_frame_loc.locator("body").wait_for(state="attached", timeout=5000)
+            log.info("  frame_locator body attached，尝试点击...")
+            for sel, desc in [
+                ("span.cb-i",            "span.cb-i"),
+                ("input[type=checkbox]", "checkbox"),
+                ("label",                "label"),
+            ]:
+                try:
+                    loc = cf_frame_loc.locator(sel).first
+                    loc.wait_for(state="attached", timeout=3000)
+                    loc.hover(timeout=2000)
+                    time.sleep(random.uniform(0.2, 0.5))
+                    loc.click(timeout=2000)
+                    log.info(f"  ✅ 降级点击成功: {desc}")
+                    fallback_clicked = True
+                    break
+                except Exception as fe:
+                    log.warning(f"  降级 [{desc}] 失败: {fe}")
+        except Exception as fe:
+            log.warning(f"  frame_locator body 未 attach: {fe}")
+
+        if not fallback_clicked:
+            log.error("【Turnstile 阶段2】所有降级方式均失败，放弃 Turnstile")
+            return False
+    else:
+        log.info(f"【Turnstile 阶段2】frame URL: {cf_frame.url[:120]}")
+        time.sleep(1)  # 给 iframe 内部 JS 初始化
+
+        # ── 阶段3：在 frame 内点击 checkbox ─────────────────────
+        log.info("【Turnstile 阶段3】在 frame 内查找并点击 checkbox...")
+
+        # 先打印 frame 内部 DOM 概况供诊断
+        try:
+            inner_html_snippet = cf_frame.locator("body").inner_html(timeout=3000)[:400]
+            log.info(f"  [诊断/frame body 前400字符] {inner_html_snippet!r}")
+        except Exception as e:
+            log.warning(f"  [诊断/frame body] 读取失败: {e}")
+
+        selectors = [
+            ("span.cb-i",            "视觉勾选框 span.cb-i"),
+            ("input[type=checkbox]", "原始 checkbox"),
+            ("label",                "label 整体"),
+            (".cb-lb",               "cb-lb 容器"),
+        ]
+        clicked = False
+        for sel, desc in selectors:
+            try:
+                loc = cf_frame.locator(sel).first
+                loc.wait_for(state="attached", timeout=4000)
+                bbox = loc.bounding_box()
+                log.info(f"  [{desc}] attached，bbox={bbox}")
+                loc.hover(timeout=3000)
+                time.sleep(random.uniform(0.2, 0.5))
+                loc.click(timeout=3000)
+                log.info(f"  ✅ 点击成功: {desc}")
+                clicked = True
+                break
+            except Exception as e:
+                log.warning(f"  [{desc}] 失败: {e}")
+
+        if not clicked:
+            log.warning("【Turnstile 阶段3】所有选择器失败，尝试坐标兜底...")
+            try:
+                frame_el = cf_frame.frame_element()
+                box = frame_el.bounding_box()
+                log.info(f"  [诊断] frame element bounding_box={box}")
+                if box:
+                    x = box["x"] + 25
+                    y = box["y"] + box["height"] / 2
+                    page.mouse.move(x, y)
+                    time.sleep(random.uniform(0.2, 0.4))
+                    page.mouse.click(x, y)
+                    log.info(f"  坐标点击 ({x:.0f}, {y:.0f})")
+                    clicked = True
+                else:
+                    log.error("  [诊断] bounding_box 返回 None，iframe 可能不可见")
+            except Exception as e:
+                log.error(f"  坐标点击失败: {e}")
+
+        if not clicked:
+            log.error("【Turnstile 阶段3】所有点击方式均失败")
+            dump_frames("阶段3失败")
+            take_screenshot(page, "turnstile_click_failed")
             return False
 
-    if not iframe_found:
-        return False
-
-    time.sleep(1)  # 给 iframe 内部 JS 初始化的时间
-
-    # 阶段3：frame_locator 穿透 iframe，按优先级依次尝试选择器
-    log.info("用 frame_locator 穿透 iframe 点击 checkbox...")
-    cf_frame = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
-
-    selectors = [
-        ("span.cb-i",            "视觉勾选框 span.cb-i"),
-        ("input[type=checkbox]", "原始 checkbox"),
-        ("label",                "label 整体"),
-        (".cb-lb",               "cb-lb 容器"),
-    ]
-
-    clicked = False
-    for sel, desc in selectors:
-        try:
-            loc = cf_frame.locator(sel).first
-            loc.wait_for(state="attached", timeout=4000)
-            loc.hover(timeout=3000)
-            time.sleep(random.uniform(0.2, 0.5))
-            loc.click(timeout=3000)
-            log.info(f"  ✅ 点击成功: {desc}")
-            clicked = True
-            break
-        except Exception as e:
-            log.debug(f"  [{desc}] 失败: {e}")
-
-    if not clicked:
-        log.warning("所有 frame_locator 选择器均失败，尝试坐标点击...")
-        try:
-            box = page.locator(
-                'iframe[src*="challenges.cloudflare.com"]'
-            ).first.bounding_box()
-            if box:
-                x = box["x"] + 25
-                y = box["y"] + box["height"] / 2
-                page.mouse.move(x, y)
-                time.sleep(random.uniform(0.2, 0.4))
-                page.mouse.click(x, y)
-                log.info(f"  坐标点击 ({x:.0f}, {y:.0f})")
-                clicked = True
-        except Exception as e:
-            log.warning(f"  坐标点击失败: {e}")
-
-    if not clicked:
-        log.error("所有点击方式均失败")
-        return False
-
-    # 阶段4：等待 token 写入（最多 timeout 秒）
-    log.info("等待 Turnstile token 填入...")
+    # ── 阶段4：等待 token 写入 ──────────────────────────────────
+    log.info("【Turnstile 阶段4】等待 token 写入（最多 30s）...")
     for i in range(timeout * 2):
         if token_ready():
             log.info(f"✅ Turnstile token 就绪（{i * 0.5:.1f}s）")
+            dump_token_state("token就绪")
             return True
         if i % 10 == 0 and i > 0:
             log.info(f"  token 等待中... {i * 0.5:.0f}s")
+            dump_token_state(f"等待{i * 0.5:.0f}s")
             take_screenshot(page, f"turnstile_wait_{i}")
         time.sleep(0.5)
 
-    log.error("Turnstile token 等待超时")
+    log.error("【Turnstile 阶段4】token 等待超时（30s）")
+    dump_token_state("超时")
+    dump_frames("超时")
+    take_screenshot(page, "turnstile_token_timeout")
     return False
 
-# ── 登录（★ 修复4：重试次数改为 2）─────────────────────────
+
+# ── 登录（重试次数 2）────────────────────────────────────
 def login(page, max_retries=2) -> bool:
     for attempt in range(1, max_retries + 1):
         log.info(f"登录 {attempt}/{max_retries} (用户: {mask(USERNAME)}) ...")
